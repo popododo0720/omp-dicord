@@ -62,6 +62,13 @@ DISCORD_MAX = 1900  # leave headroom under Discord's 2000-char limit
 
 THINK_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh")
 
+# Embed styling for pretty output (colored sidebar + footer status).
+EMBED_DESC_MAX = 4000          # Discord embed description hard limit is 4096
+COLOR_STREAM = 0x5865F2        # blurple while streaming
+COLOR_DONE = 0x57F287          # green when finished
+COLOR_TIMEOUT = 0xFEE75C       # yellow on idle timeout
+COLOR_ERROR = 0xED4245         # red on error
+
 
 # ---------------------------------------------------------------------------
 # omp RPC session — one subprocess per channel, kept alive for context.
@@ -550,7 +557,7 @@ async def on_message(msg: discord.Message) -> None:
     subagents: list[str] = []
     collected = ""
 
-    def status_line(done: bool, extra: str = "") -> str:
+    def status_text(done: bool, extra: str = "") -> str:
         elapsed = time.monotonic() - started
         parts = [f"⏱ {elapsed:.1f}s"]
         if tools:
@@ -562,18 +569,25 @@ async def on_message(msg: discord.Message) -> None:
         if extra:
             parts.append(extra)
         parts.append("omp")
-        prefix = ""
+        return ("  ·  ".join(parts))[:2040]
+
+    def build_embed(done: bool, *, timed_out: bool = False, extra: str = "",
+                    body: str | None = None) -> discord.Embed:
+        text = collected if body is None else body
         if not done:
-            prefix = "🤔 생각 중…  ·  " if not collected else "✍️ 작성 중…  ·  "
-        return "-# " + prefix + "  ·  ".join(parts)
+            desc = (text[:EMBED_DESC_MAX] + "▌") if text else "…"
+            label = "🤔 생각 중…" if not text else "✍️ 작성 중…"
+            color = COLOR_STREAM
+        else:
+            desc = (text[:EMBED_DESC_MAX] if text else "(응답 없음)")
+            label = "⌛ 타임아웃" if timed_out else "✅ 완료"
+            color = COLOR_TIMEOUT if timed_out else COLOR_DONE
+        emb = discord.Embed(description=desc, color=color)
+        emb.set_author(name=label)
+        emb.set_footer(text=status_text(done, extra))
+        return emb
 
-    def render_stream() -> str:
-        body = collected[:DISCORD_MAX] if collected else "…"
-        if collected:
-            body += "▌"
-        return body + "\n" + status_line(done=False)
-
-    placeholder = await msg.reply(content=render_stream(), mention_author=False)
+    placeholder = await msg.reply(embed=build_embed(False), mention_author=False)
     # Register this job so deleting the Discord message can dequeue it while it
     # is still waiting for the session lock (before omp receives the prompt).
     _cur = asyncio.current_task()
@@ -591,12 +605,22 @@ async def on_message(msg: discord.Message) -> None:
     async def flush() -> None:
         nonlocal last_edit, pending, min_interval
         try:
-            await placeholder.edit(content=render_stream())
+            await placeholder.edit(embed=build_embed(False))
             last_edit = time.monotonic()
             pending = False
         except discord.HTTPException as exc:
             if getattr(exc, "status", None) == 429:
                 min_interval = min(min_interval * 1.5, 4.0)
+            else:
+                # Embed rejected for some reason -> fall back to plain text so the
+                # user still sees output instead of a frozen placeholder.
+                try:
+                    body = (collected[:DISCORD_MAX] + "▌") if collected else "…"
+                    await placeholder.edit(content=body, embed=None)
+                    last_edit = time.monotonic()
+                    pending = False
+                except discord.HTTPException:
+                    pass
 
     timed_out = False
     async with msg.channel.typing():
@@ -651,32 +675,32 @@ async def on_message(msg: discord.Message) -> None:
         collected = f"{collected}\n\n{note}" if collected else note
     collected = collected or "(응답 없음)"
 
-    footer = "\n" + status_line(done=True, extra=ctx_extra)
-
-    # Long replies: attach as a file instead of paginating across many messages.
+    # Long replies: attach as a file, show a preview embed. Else one green embed.
     if len(collected) > FILE_THRESHOLD:
-        preview = collected[:600].rstrip()
+        preview = collected[:1500].rstrip()
         buf = io.BytesIO(collected.encode("utf-8"))
         file = discord.File(buf, filename="omp-response.md")
-        head = f"{preview}\n\n… (전체 {len(collected):,}자 첨부)" + footer
+        body = f"{preview}\n\n… (전체 {len(collected):,}자 — 첨부 파일 참조)"
         try:
-            await placeholder.edit(content=head[:2000])
+            await placeholder.edit(embed=build_embed(True, timed_out=timed_out,
+                                                     extra=ctx_extra, body=body))
             await msg.channel.send(file=file)
         except discord.HTTPException as exc:
             print(f"[omp-bot] file send failed: {exc}")
-            await placeholder.edit(content=collected[:2000])
+            try:
+                await placeholder.edit(content=collected[:1900], embed=None)
+            except discord.HTTPException:
+                pass
     else:
-        pages = _chunk(collected, DISCORD_MAX)
-        if len(pages[-1]) + len(footer) <= 2000:
-            pages[-1] += footer
-            footer_msg = None
-        else:
-            footer_msg = status_line(done=True, extra=ctx_extra)
-        await placeholder.edit(content=pages[0])
-        for extra in pages[1:]:
-            await msg.channel.send(extra)
-        if footer_msg:
-            await msg.channel.send(footer_msg)
+        try:
+            await placeholder.edit(embed=build_embed(True, timed_out=timed_out,
+                                                     extra=ctx_extra))
+        except discord.HTTPException:
+            # Fallback to plain text pagination if the embed is rejected.
+            pages = _chunk(collected, DISCORD_MAX)
+            await placeholder.edit(content=pages[0], embed=None)
+            for extra in pages[1:]:
+                await msg.channel.send(extra)
 
     # Ping the author for long turns so they can step away and get notified.
     if elapsed >= PING_AFTER and not timed_out:
