@@ -380,6 +380,16 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
 # the "!" prefix. Discord shows "/" as a slash-command hint but with no real app
 # command registered the raw text still arrives here, so we parse it ourselves.
 # ---------------------------------------------------------------------------
+async def reply_embed(msg: discord.Message, text: str, color: int = COLOR_DONE) -> None:
+    """Reply with a compact colored embed (keeps command output visually consistent
+    with agent answers instead of plain chat text)."""
+    try:
+        await msg.reply(embed=discord.Embed(description=text[:EMBED_DESC_MAX], color=color),
+                        mention_author=False)
+    except discord.HTTPException:
+        await msg.reply(text[:1900], mention_author=False)
+
+
 async def handle_command(msg: discord.Message, sess: OmpSession, raw: str) -> bool:
     m = re.match(r"^[/!](\w+)\s*(.*)$", raw, re.DOTALL)
     if not m:
@@ -393,54 +403,55 @@ async def handle_command(msg: discord.Message, sess: OmpSession, raw: str) -> bo
                 await sess.proc.stdin.drain()  # type: ignore[union-attr]
             except Exception:  # noqa: BLE001
                 pass
-            await msg.reply("⏹ 현재 턴을 중단했어요.", mention_author=False)
+            await reply_embed(msg, "⏹ 현재 턴을 중단했어요.")
         else:
-            await msg.reply("실행 중인 작업이 없어요.", mention_author=False)
+            await reply_embed(msg, "실행 중인 작업이 없어요.", COLOR_STREAM)
         return True
 
     if cmd == "help":
-        await msg.reply(
+        await reply_embed(
+            msg,
             "**명령어**\n"
             "`/stop` 현재 턴 중단 · `/new` 새 세션(컨텍스트 초기화) · `/compact` 컨텍스트 압축\n"
             "`/model [이름]` 모델 보기/변경 · `/think [레벨]` 사고량(off·minimal·low·medium·high·xhigh)\n"
             "`/stats` 상태(모델·컨텍스트%) · `/help` 도움말\n"
             "그 외 메시지는 프롬프트. 스트리밍 중 새 메시지는 **끼어들기(steer)**, 이미지 첨부 지원.",
-            mention_author=False,
+            COLOR_STREAM,
         )
         return True
 
     # The rest mutate session state — refuse mid-turn to avoid corrupting the run.
     if sess.busy and cmd in ("new", "compact", "model", "think", "thinking", "stats", "state", "status"):
-        await msg.reply("실행 중이에요. 먼저 `/stop` 후 다시 시도하세요.", mention_author=False)
+        await reply_embed(msg, "실행 중이에요. 먼저 `/stop` 후 다시 시도하세요.", COLOR_ERROR)
         return True
 
     if cmd == "new":
         r = await sess.request({"type": "new_session"})
         ok = r.get("success")
-        await msg.reply("🆕 새 세션 시작 (컨텍스트 초기화됨)." if ok else "새 세션 실패.",
-                        mention_author=False)
+        await reply_embed(msg, "🆕 새 세션 시작 (컨텍스트 초기화됨)." if ok else "새 세션 실패.",
+                          COLOR_DONE if ok else COLOR_ERROR)
         return True
 
     if cmd == "compact":
         async with msg.channel.typing():
             r = await sess.request({"type": "compact"}, timeout=180.0)
-        await msg.reply("🗜 컨텍스트를 압축했어요." if r.get("success") else "압축 실패/타임아웃.",
-                        mention_author=False)
+        await reply_embed(msg, "🗜 컨텍스트를 압축했어요." if r.get("success") else "압축 실패/타임아웃.",
+                          COLOR_DONE if r.get("success") else COLOR_ERROR)
         return True
 
     if cmd in ("think", "thinking"):
         if not arg:
             r = await sess.request({"type": "cycle_thinking_level"})
             lvl = (r.get("data") or {}).get("thinkingLevel") or (r.get("data") or {}).get("level")
-            await msg.reply(f"🧠 사고량: **{lvl or '변경됨'}**", mention_author=False)
+            await reply_embed(msg, f"🧠 사고량: **{lvl or '변경됨'}**")
             return True
         lvl = arg.lower()
         if lvl not in THINK_LEVELS:
-            await msg.reply(f"레벨은 {', '.join(THINK_LEVELS)} 중 하나.", mention_author=False)
+            await reply_embed(msg, f"레벨은 {', '.join(THINK_LEVELS)} 중 하나.", COLOR_ERROR)
             return True
         r = await sess.request({"type": "set_thinking_level", "level": lvl})
-        await msg.reply(f"🧠 사고량 → **{lvl}**" if r.get("success") else "변경 실패.",
-                        mention_author=False)
+        await reply_embed(msg, f"🧠 사고량 → **{lvl}**" if r.get("success") else "변경 실패.",
+                          COLOR_DONE if r.get("success") else COLOR_ERROR)
         return True
 
     if cmd == "model":
@@ -457,8 +468,8 @@ async def handle_command(msg: discord.Message, sess: OmpSession, raw: str) -> bo
                 else:
                     names.append(str(md))
             listing = "\n".join(f"• {n}" for n in names) or "(목록 없음)"
-            await msg.reply(f"현재: **{cur_s}**\n사용 가능:\n{listing}\n\n변경: `/model <이름일부>`",
-                            mention_author=False)
+            await reply_embed(msg, f"현재: **{cur_s}**\n사용 가능:\n{listing}\n\n변경: `/model <이름일부>`",
+                              COLOR_STREAM)
             return True
         # match by substring against provider/id
         target = None
@@ -471,11 +482,11 @@ async def handle_command(msg: discord.Message, sess: OmpSession, raw: str) -> bo
                 target = (prov, mid)
                 break
         if not target:
-            await msg.reply(f"'{arg}' 매칭 모델 없음. `/model` 로 목록 확인.", mention_author=False)
+            await reply_embed(msg, f"'{arg}' 매칭 모델 없음. `/model` 로 목록 확인.", COLOR_ERROR)
             return True
         r = await sess.request({"type": "set_model", "provider": target[0], "modelId": target[1]})
-        await msg.reply(f"🤖 모델 → **{target[0]}/{target[1]}**" if r.get("success") else "모델 변경 실패.",
-                        mention_author=False)
+        await reply_embed(msg, f"🤖 모델 → **{target[0]}/{target[1]}**" if r.get("success") else "모델 변경 실패.",
+                          COLOR_DONE if r.get("success") else COLOR_ERROR)
         return True
 
     if cmd in ("stats", "state", "status"):
@@ -485,12 +496,13 @@ async def handle_command(msg: discord.Message, sess: OmpSession, raw: str) -> bo
         cu = d.get("contextUsage") or {}
         pct = cu.get("percent")
         pct_s = f"{pct*100:.0f}%" if isinstance(pct, (int, float)) and pct <= 1 else (f"{pct:.0f}%" if isinstance(pct, (int, float)) else "?")
-        await msg.reply(
+        await reply_embed(
+            msg,
             f"**상태**\n모델 `{model.get('provider','?')}/{model.get('id','?')}` · "
             f"사고량 `{d.get('thinkingLevel','?')}`\n"
             f"컨텍스트 {cu.get('tokens','?')}/{cu.get('contextWindow','?')} ({pct_s}) · "
             f"메시지 {d.get('messageCount','?')} · 큐 {d.get('queuedMessageCount', 0)}",
-            mention_author=False,
+            COLOR_STREAM,
         )
         return True
 
@@ -515,7 +527,7 @@ async def on_message(msg: discord.Message) -> None:
         return
     # Whitelist gate — the agent can touch real infra, so this is mandatory.
     if msg.author.id not in ALLOWED_USER_IDS:
-        await msg.reply("⛔ 허가되지 않은 사용자입니다.", mention_author=False)
+        await reply_embed(msg, "⛔ 허가되지 않은 사용자입니다.", COLOR_ERROR)
         return
 
     text = re.sub(r"<@[&!]?\d+>", "", msg.content)  # strip user & role mention tokens
@@ -528,7 +540,7 @@ async def on_message(msg: discord.Message) -> None:
     try:
         sess = await get_session(msg.channel.id)
     except Exception as exc:  # noqa: BLE001
-        await msg.reply(f"❌ omp 세션 시작 실패: {exc}", mention_author=False)
+        await reply_embed(msg, f"❌ omp 세션 시작 실패: {exc}", COLOR_ERROR)
         return
 
     # Prefix commands.
@@ -537,7 +549,7 @@ async def on_message(msg: discord.Message) -> None:
             if await handle_command(msg, sess, text):
                 return
         except Exception as exc:  # noqa: BLE001
-            await msg.reply(f"명령 처리 실패: {exc}", mention_author=False)
+            await reply_embed(msg, f"명령 처리 실패: {exc}", COLOR_ERROR)
             return
 
     # If a turn is already streaming, this message STEERS it (끼어들기) instead of
@@ -549,7 +561,7 @@ async def on_message(msg: discord.Message) -> None:
             await msg.add_reaction("🎯")
             print(f"[omp-bot] steered running turn on channel {msg.channel.id}")
         except Exception as exc:  # noqa: BLE001
-            await msg.reply(f"끼어들기 실패: {exc}", mention_author=False)
+            await reply_embed(msg, f"끼어들기 실패: {exc}", COLOR_ERROR)
         return
 
     started = time.monotonic()
