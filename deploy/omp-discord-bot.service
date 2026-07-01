@@ -1,0 +1,20 @@
+[Unit]
+Description=omp Discord bridge bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/omp-discord-bot
+EnvironmentFile=/root/omp-discord-bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/root
+Environment=PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
+ExecStart=/root/omp-discord-bot/.venv/bin/python /root/omp-discord-bot/bot.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:/root/omp-discord-bot/bot.log
+StandardError=append:/root/omp-discord-bot/bot.log
+
+[Install]
+WantedBy=multi-user.target
