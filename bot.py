@@ -130,6 +130,10 @@ class OmpSession:
             await self._drain()
             self._write({"type": "prompt", "message": message})
             await self.proc.stdin.drain()  # type: ignore[union-attr]
+            # Past this point the turn is handed to omp and WILL run, so it can
+            # no longer be pulled from the queue. Signal the consumer to mark the
+            # job as started (delete-to-dequeue only works before this).
+            yield ("accepted", "")
             while True:
                 frame = await self._readline(timeout=IDLE_TIMEOUT)
                 if frame is None:
@@ -172,6 +176,20 @@ _sessions: dict[int, OmpSession] = {}
 # a 90s ready-handshake froze get_session for every channel at once).
 _spawn_locks: dict[int, asyncio.Lock] = {}
 _spawn_locks_guard = asyncio.Lock()
+
+
+@dataclass
+class Job:
+    """One in-flight user message. `started` flips true once the prompt is
+    handed to omp; before that the job is still queued and can be dequeued by
+    deleting the Discord message."""
+    task: asyncio.Task
+    placeholder: discord.Message
+    started: bool = False
+
+
+# message_id -> Job, for delete-to-dequeue.
+_jobs: dict[int, Job] = {}
 
 
 def _spawn_lock(channel_id: int) -> asyncio.Lock:
@@ -248,6 +266,26 @@ async def on_ready() -> None:
 
 
 @client.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
+    # Delete-to-dequeue: if the user deletes their prompt while it's still
+    # waiting in the queue (not yet handed to omp), cancel it and drop the
+    # placeholder. If it already started running, we can't un-run it.
+    job = _jobs.get(payload.message_id)
+    if job is None:
+        return
+    if job.started:
+        print(f"[omp-bot] delete ignored (already running): msg={payload.message_id}")
+        return
+    job.task.cancel()
+    _jobs.pop(payload.message_id, None)
+    try:
+        await job.placeholder.delete()
+    except discord.HTTPException:
+        pass
+    print(f"[omp-bot] dequeued by delete: msg={payload.message_id}")
+
+
+@client.event
 async def on_message(msg: discord.Message) -> None:
     ch = type(msg.channel).__name__
     print(f"[omp-bot] RX: author={msg.author}({msg.author.id}) ch={ch} "
@@ -298,10 +336,17 @@ async def on_message(msg: discord.Message) -> None:
         return body + "\n" + status_line(done=False)
 
     placeholder = await msg.reply(content=render_stream(), mention_author=False)
+    # Register this job so deleting the Discord message can dequeue it while it
+    # is still waiting for the session lock (before omp receives the prompt).
+    _cur = asyncio.current_task()
+    job = Job(task=_cur, placeholder=placeholder) if _cur is not None else None
+    if job is not None:
+        _jobs[msg.id] = job
     try:
         sess = await get_session(msg.channel.id)
     except Exception as exc:  # noqa: BLE001
         await placeholder.edit(content=f"❌ omp 세션 시작 실패: {exc}")
+        _jobs.pop(msg.id, None)
         return
 
     # If the session is mid-turn, this prompt will queue behind it (prompt()
@@ -338,6 +383,10 @@ async def on_message(msg: discord.Message) -> None:
     timed_out = False
     async with msg.channel.typing():
         async for kind, payload in sess.prompt(text):
+            if kind == "accepted":
+                if job is not None:
+                    job.started = True
+                continue
             if kind == "delta":
                 collected += payload
                 pending = True
@@ -372,6 +421,7 @@ async def on_message(msg: discord.Message) -> None:
         await msg.channel.send(extra)
     if footer_msg:
         await msg.channel.send(footer_msg)
+    _jobs.pop(msg.id, None)
 
 
 def main() -> None:
