@@ -64,6 +64,10 @@ class OmpSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            # omp can emit a single JSON frame far bigger than asyncio's default
+            # 64KB readline buffer (big tool results / large messages). Without a
+            # raised limit, readline() throws LimitOverrunError and kills the turn.
+            limit=16 * 1024 * 1024,
         )
         self = cls(proc=proc)
         await self._await_ready()
@@ -74,6 +78,12 @@ class OmpSession:
         try:
             raw = await asyncio.wait_for(self.proc.stdout.readline(), timeout=timeout)
         except asyncio.TimeoutError:
+            return None
+        except (ValueError, asyncio.LimitOverrunError) as exc:
+            # A single frame exceeded even the raised buffer. The oversized data
+            # stays in the buffer (would re-raise forever), so end the turn
+            # cleanly instead of looping or crashing the generator.
+            print(f"[omp-bot] oversized RPC frame, ending turn: {exc}")
             return None
         if not raw:
             return None
