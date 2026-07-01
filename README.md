@@ -1,24 +1,24 @@
 # omp-dicord
 
-Discord에서 [omp](https://omp.sh) 에이전트를 원격 조종하는 봇.
+A Discord bot to drive the [omp](https://omp.sh) agent remotely.
 
-## 설치
+## Install
 
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
-cp .env.example .env   # 아래 2개 값 입력
+cp .env.example .env   # fill in the 2 values below
 ```
 
-## .env (2개만)
+## .env (just 2 values)
 
-- `DISCORD_BOT_TOKEN` — [Developer Portal](https://discord.com/developers/applications) → Bot → Reset Token (**MESSAGE CONTENT INTENT 켜기**)
-- `ALLOWED_USER_IDS` — Discord 개발자 모드 ON → 내 프로필 우클릭 → ID 복사
+- `DISCORD_BOT_TOKEN` — [Developer Portal](https://discord.com/developers/applications) → Bot → Reset Token (**enable MESSAGE CONTENT INTENT**)
+- `ALLOWED_USER_IDS` — enable Discord Developer Mode → right-click your profile → Copy ID
 
-## 실행
+## Run
 
 ```bash
 ./run.sh
 ```
 
-DM으로 메시지, 또는 서버에서 `@봇 명령`.
+DM the bot, or mention it in a server: `@bot <command>`.
