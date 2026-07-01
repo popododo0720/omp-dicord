@@ -35,6 +35,11 @@ OMP_ARGS = os.environ.get("OMP_ARGS", "--yolo").split()
 IDLE_TIMEOUT = float(os.environ.get("OMP_IDLE_TIMEOUT", "300"))
 # Seconds to wait for the RPC "ready" handshake on cold start (contention-safe).
 READY_TIMEOUT = float(os.environ.get("OMP_READY_TIMEOUT", "90"))
+# Per-channel session storage: lets sessions survive a bot restart via
+# `--session-dir <root>/<channel_id> --continue` (context resume).
+SESSION_ROOT = os.environ.get(
+    "OMP_SESSION_ROOT", os.path.expanduser("~/.omp/agent/discord-sessions")
+)
 DISCORD_MAX = 1900  # leave headroom under Discord's 2000-char limit
 
 
@@ -47,9 +52,14 @@ class OmpSession:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @classmethod
-    async def start(cls) -> "OmpSession":
+    async def start(cls, channel_id: int) -> "OmpSession":
+        # Isolate each channel's session in its own dir and --continue it, so a
+        # bot restart resumes that channel's conversation instead of losing it.
+        sess_dir = os.path.join(SESSION_ROOT, str(channel_id))
+        os.makedirs(sess_dir, exist_ok=True)
         proc = await asyncio.create_subprocess_exec(
             OMP_BIN, "--mode", "rpc", *OMP_ARGS,
+            "--session-dir", sess_dir, "--continue",
             cwd=OMP_CWD,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -178,7 +188,7 @@ async def get_session(channel_id: int) -> OmpSession:
         last_exc: Exception | None = None
         for attempt in range(2):  # cold start can lose the ready race under load
             try:
-                sess = await OmpSession.start()
+                sess = await OmpSession.start(channel_id)
                 _sessions[channel_id] = sess
                 return sess
             except Exception as exc:  # noqa: BLE001
