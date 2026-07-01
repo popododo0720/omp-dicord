@@ -33,6 +33,8 @@ OMP_CWD = os.environ.get("OMP_CWD", os.path.expanduser("~"))
 OMP_ARGS = os.environ.get("OMP_ARGS", "--yolo").split()
 # Seconds of silence from the agent before we assume the turn is done.
 IDLE_TIMEOUT = float(os.environ.get("OMP_IDLE_TIMEOUT", "300"))
+# Seconds to wait for the RPC "ready" handshake on cold start (contention-safe).
+READY_TIMEOUT = float(os.environ.get("OMP_READY_TIMEOUT", "90"))
 DISCORD_MAX = 1900  # leave headroom under Discord's 2000-char limit
 
 
@@ -72,12 +74,24 @@ class OmpSession:
 
     async def _await_ready(self) -> None:
         # Consume frames until the {"type":"ready"} handshake.
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + READY_TIMEOUT
         while time.monotonic() < deadline:
-            frame = await self._readline(timeout=30)
+            remaining = deadline - time.monotonic()
+            frame = await self._readline(timeout=max(1.0, remaining))
             if frame and frame.get("type") == "ready":
                 return
         raise RuntimeError("omp rpc did not emit ready frame")
+
+    async def _drain(self) -> int:
+        """Discard any frames left in the pipe from a previously-interrupted
+        turn, so the next prompt does not read stale output (desync guard).
+        Returns the number of frames dropped."""
+        dropped = 0
+        while True:
+            frame = await self._readline(timeout=0.05)
+            if frame is None:
+                return dropped
+            dropped += 1
 
     def _write(self, obj: dict) -> None:
         assert self.proc.stdin
@@ -91,11 +105,16 @@ class OmpSession:
         generator suspended holding the lock -> next prompt deadlocked.)
         """
         async with self.lock:
+            # Drop any stale frames from a previously-interrupted turn so this
+            # prompt's stream can't get contaminated by the last one (desync).
+            await self._drain()
             self._write({"type": "prompt", "message": message})
             await self.proc.stdin.drain()  # type: ignore[union-attr]
             while True:
                 frame = await self._readline(timeout=IDLE_TIMEOUT)
                 if frame is None:
+                    # No output for IDLE_TIMEOUT: surface it instead of dying quietly.
+                    yield ("timeout", str(int(IDLE_TIMEOUT)))
                     return
                 ftype = frame.get("type")
                 if ftype == "message_update":
@@ -128,25 +147,56 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 _sessions: dict[int, OmpSession] = {}
-_sessions_lock = asyncio.Lock()
+# Per-channel spawn locks so a slow cold start on one channel never blocks
+# other channels (the old single global lock caused head-of-line blocking:
+# a 90s ready-handshake froze get_session for every channel at once).
+_spawn_locks: dict[int, asyncio.Lock] = {}
+_spawn_locks_guard = asyncio.Lock()
+
+
+def _spawn_lock(channel_id: int) -> asyncio.Lock:
+    lock = _spawn_locks.get(channel_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _spawn_locks[channel_id] = lock
+    return lock
 
 
 async def get_session(channel_id: int) -> OmpSession:
-    async with _sessions_lock:
-        sess = _sessions.get(channel_id)
-        if sess is None or not sess.alive():
-            sess = await OmpSession.start()
-            _sessions[channel_id] = sess
+    # Fast path: a live session already exists.
+    sess = _sessions.get(channel_id)
+    if sess is not None and sess.alive():
         return sess
+    # Slow path: serialize spawns per-channel so two near-simultaneous messages
+    # in the same channel don't each launch an omp process.
+    async with _spawn_locks_guard:
+        lock = _spawn_lock(channel_id)
+    async with lock:
+        sess = _sessions.get(channel_id)
+        if sess is not None and sess.alive():
+            return sess
+        last_exc: Exception | None = None
+        for attempt in range(2):  # cold start can lose the ready race under load
+            try:
+                sess = await OmpSession.start()
+                _sessions[channel_id] = sess
+                return sess
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                print(f"[omp-bot] session start failed (attempt {attempt + 1}/2): {exc}")
+        raise last_exc  # type: ignore[misc]
 
 
-def _chunk(text: str) -> list[str]:
+def _chunk(text: str, limit: int = DISCORD_MAX) -> list[str]:
     out, buf = [], ""
     for line in text.split("\n"):
-        while len(line) > DISCORD_MAX:
-            out.append(line[:DISCORD_MAX])
-            line = line[DISCORD_MAX:]
-        if len(buf) + len(line) + 1 > DISCORD_MAX:
+        while len(line) > limit:
+            if buf:
+                out.append(buf)
+                buf = ""
+            out.append(line[:limit])
+            line = line[limit:]
+        if len(buf) + len(line) + 1 > limit:
             out.append(buf)
             buf = line
         else:
@@ -156,11 +206,25 @@ def _chunk(text: str) -> list[str]:
     return out or ["(빈 응답)"]
 
 
+_prewarmed = False
+
+
 @client.event
 async def on_ready() -> None:
+    global _prewarmed
     guilds = ", ".join(g.name for g in client.guilds) or "(공유 서버 없음!)"
     print(f"[omp-bot] logged in as {client.user} | whitelist={ALLOWED_USER_IDS}")
     print(f"[omp-bot] guilds: {guilds}")
+    # Pre-warm bound-channel sessions so the first real message doesn't eat the
+    # cold-start cost (which under load blew past the ready timeout and stalled).
+    if not _prewarmed and OMP_CHANNEL_IDS:
+        _prewarmed = True
+        for cid in OMP_CHANNEL_IDS:
+            try:
+                await get_session(cid)
+                print(f"[omp-bot] pre-warmed session for channel {cid}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[omp-bot] pre-warm failed for channel {cid}: {exc}")
 
 
 @client.event
@@ -191,33 +255,47 @@ async def on_message(msg: discord.Message) -> None:
         return
 
     started = time.monotonic()
+    tools: list[str] = []
+    collected = ""
 
-    def build_embed(body: str, *, done: bool) -> discord.Embed:
-        color = 0x2ECC71 if done else 0x5865F2  # green when done, blurple while working
-        shown = body[:4000] if body else "…"
-        if not done and body:
-            shown = (shown[:3999] + "▌")  # streaming cursor
-        emb = discord.Embed(description=shown, color=color)
+    def status_line(done: bool) -> str:
         elapsed = time.monotonic() - started
         parts = [f"⏱ {elapsed:.1f}s"]
         if tools:
             uniq = list(dict.fromkeys(tools))  # de-dup, keep order
             parts.append("🔧 " + ", ".join(uniq[-5:]))
         parts.append("omp")
-        emb.set_footer(text="  ·  ".join(parts))
+        prefix = ""
         if not done:
-            emb.set_author(name="🤔 생각 중…" if not body else "✍️ 작성 중…")
-        return emb
+            prefix = "🤔 생각 중…  ·  " if not collected else "✍️ 작성 중…  ·  "
+        # Discord subtext (-#): small grey status line, full chat width.
+        return "-# " + prefix + "  ·  ".join(parts)
 
-    tools: list[str] = []
-    placeholder = await msg.reply(embed=build_embed("", done=False), mention_author=False)
+    def render_stream() -> str:
+        body = collected[:DISCORD_MAX] if collected else "…"
+        if collected:
+            body += "▌"  # streaming cursor
+        return body + "\n" + status_line(done=False)
+
+    placeholder = await msg.reply(content=render_stream(), mention_author=False)
     try:
         sess = await get_session(msg.channel.id)
     except Exception as exc:  # noqa: BLE001
-        await placeholder.edit(embed=build_embed(f"❌ omp 세션 시작 실패: {exc}", done=True))
+        await placeholder.edit(content=f"❌ omp 세션 시작 실패: {exc}")
         return
 
-    collected = ""
+    # If the session is mid-turn, this prompt will queue behind it (prompt()
+    # awaits the per-session lock). Tell the user instead of showing a frozen
+    # "생각 중" that never advances.
+    if sess.lock.locked():
+        try:
+            await placeholder.edit(
+                content="⏳ 앞 작업을 처리하는 중입니다. 끝나는 대로 이어서 답할게요…\n"
+                        + status_line(done=False)
+            )
+        except discord.HTTPException:
+            pass
+
     last_edit = 0.0
     min_interval = 1.0          # base edit throttle (Discord rate limit ~5/5s per channel)
     pending = False             # unflushed content exists
@@ -226,10 +304,10 @@ async def on_message(msg: discord.Message) -> None:
         # flush on sentence / line boundaries for natural chunks
         return s.endswith(("\n", ". ", "! ", "? ", "다.", "요.", "죠.", "…", ".", "!", "?"))
 
-    async def flush(done: bool = False) -> None:
+    async def flush() -> None:
         nonlocal last_edit, pending, min_interval
         try:
-            await placeholder.edit(embed=build_embed(collected or "…", done=done))
+            await placeholder.edit(content=render_stream())
             last_edit = time.monotonic()
             pending = False
         except discord.HTTPException as exc:
@@ -237,6 +315,7 @@ async def on_message(msg: discord.Message) -> None:
             if getattr(exc, "status", None) == 429:
                 min_interval = min(min_interval * 1.5, 4.0)
 
+    timed_out = False
     async with msg.channel.typing():
         async for kind, payload in sess.prompt(text):
             if kind == "delta":
@@ -245,18 +324,34 @@ async def on_message(msg: discord.Message) -> None:
             elif kind == "tool":
                 tools.append(payload)
                 pending = True
+            elif kind == "timeout":
+                timed_out = True
+                print(f"[omp-bot] idle timeout ({payload}s) with no output on channel {msg.channel.id}")
+                break
             now = time.monotonic()
             if pending and now - last_edit >= min_interval:
                 # prefer flushing at a natural boundary once past the throttle
                 if at_boundary(collected) or now - last_edit >= min_interval * 2:
-                    await flush(done=False)
+                    await flush()
 
-    # Final render. Long answers: first 4000 chars in the embed, overflow as follow-up messages.
+    # Final render as full-width plain text, paginated across messages.
+    if timed_out:
+        mins = int(IDLE_TIMEOUT // 60)
+        note = f"⌛ {mins}분 동안 응답이 없어 이번 턴을 종료했어요. 다시 말 걸어주세요."
+        collected = f"{collected}\n\n{note}" if collected else note
     collected = collected or "(응답 없음)"
-    await flush(done=True)
-    if len(collected) > 4000:
-        for extra in _chunk(collected[4000:]):
-            await msg.channel.send(extra)
+    pages = _chunk(collected, DISCORD_MAX)
+    footer = "\n" + status_line(done=True)
+    if len(pages[-1]) + len(footer) <= 2000:
+        pages[-1] += footer
+        footer_msg = None
+    else:
+        footer_msg = status_line(done=True)
+    await placeholder.edit(content=pages[0])
+    for extra in pages[1:]:
+        await msg.channel.send(extra)
+    if footer_msg:
+        await msg.channel.send(footer_msg)
 
 
 def main() -> None:
