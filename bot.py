@@ -517,8 +517,10 @@ async def handle_command(msg: discord.Message, sess: OmpSession, raw: str) -> bo
             ("메시지", str(d.get("messageCount", "?"))),
             ("큐", str(d.get("queuedMessageCount", 0))),
         ]
-        w = max(len(k) for k, _ in rows)
-        table = "\n".join(f"{k.ljust(w)} │ {v}" for k, v in rows)
+        def _dw(s: str) -> int:  # display width: CJK counts as 2 columns
+            return sum(2 if ord(c) > 0x1100 else 1 for c in s)
+        w = max(_dw(k) for k, _ in rows)
+        table = "\n".join(f"{k}{' ' * (w - _dw(k))} │ {v}" for k, v in rows)
         await reply_embed(msg, f"📊 **omp 상태**\n```\n{table}\n```", COLOR_STREAM)
         return True
 
