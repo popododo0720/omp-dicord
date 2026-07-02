@@ -62,37 +62,13 @@ DISCORD_MAX = 1900  # leave headroom under Discord's 2000-char limit
 
 THINK_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh")
 
-# Embed styling for pretty output (colored sidebar + footer status).
-EMBED_DESC_MAX = 4000          # Discord embed description hard limit is 4096
-COLOR_STREAM = 0x5865F2        # blurple while streaming
-COLOR_DONE = 0x57F287          # green when finished
-COLOR_TIMEOUT = 0xFEE75C       # yellow on idle timeout
-COLOR_ERROR = 0xED4245         # red on error
-
-
-def _make_spacer_png(width: int = 1024, height: int = 1) -> bytes:
-    """A wide, fully-transparent PNG. Set as an embed image it forces the card
-    to Discord's max embed width so short answers don't shrink into a tiny box."""
-    import struct
-    import zlib
-
-    def _chunk(typ: bytes, data: bytes) -> bytes:
-        return (struct.pack(">I", len(data)) + typ + data
-                + struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff))
-
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)  # 8-bit RGBA
-    raw = (b"\x00" + b"\x00" * (width * 4)) * height             # transparent rows
-    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
-            + _chunk(b"IDAT", zlib.compress(raw, 9)) + _chunk(b"IEND", b""))
-
-
-SPACER_PNG = _make_spacer_png()
-SPACER_NAME = "spacer.png"
-
-
-def _spacer_file() -> "discord.File":
-    """Fresh File wrapping the spacer (a File's stream is single-use)."""
-    return discord.File(io.BytesIO(SPACER_PNG), filename=SPACER_NAME)
+# Full-width plain-text mode. These "color" constants are kept only so the many
+# reply_embed(...) callsites keep working; the value now selects a leading emoji
+# marker instead of an embed sidebar (Discord embeds can't span full chat width).
+COLOR_STREAM = 0        # info / neutral
+COLOR_DONE = 1          # success
+COLOR_TIMEOUT = 2       # warning
+COLOR_ERROR = 3         # error
 
 
 # ---------------------------------------------------------------------------
@@ -406,14 +382,15 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
 # command registered the raw text still arrives here, so we parse it ourselves.
 # ---------------------------------------------------------------------------
 async def reply_embed(msg: discord.Message, text: str, color: int = COLOR_DONE) -> None:
-    """Reply with a compact colored embed (keeps command output visually consistent
-    with agent answers instead of plain chat text)."""
-    emb = discord.Embed(description=text[:EMBED_DESC_MAX], color=color)
-    emb.set_image(url=f"attachment://{SPACER_NAME}")
-    try:
-        await msg.reply(embed=emb, file=_spacer_file(), mention_author=False)
-    except discord.HTTPException:
-        await msg.reply(text[:1900], mention_author=False)
+    """Reply with full-width plain text (Discord embeds can't span the chat width,
+    which the user wanted). `color` is kept for callsite compatibility and now
+    only adds a small leading marker for warnings/errors."""
+    marker = {COLOR_ERROR: "⚠️ ", COLOR_TIMEOUT: "⌛ "}.get(color, "")
+    body = marker + text
+    pages = _chunk(body, DISCORD_MAX)
+    await msg.reply(pages[0], mention_author=False)
+    for extra in pages[1:]:
+        await msg.channel.send(extra)
 
 
 async def handle_command(msg: discord.Message, sess: OmpSession, raw: str) -> bool:
@@ -521,15 +498,28 @@ async def handle_command(msg: discord.Message, sess: OmpSession, raw: str) -> bo
         model = d.get("model") or {}
         cu = d.get("contextUsage") or {}
         pct = cu.get("percent")
-        pct_s = f"{pct*100:.0f}%" if isinstance(pct, (int, float)) and pct <= 1 else (f"{pct:.0f}%" if isinstance(pct, (int, float)) else "?")
-        await reply_embed(
-            msg,
-            f"**상태**\n모델 `{model.get('provider','?')}/{model.get('id','?')}` · "
-            f"사고량 `{d.get('thinkingLevel','?')}`\n"
-            f"컨텍스트 {cu.get('tokens','?')}/{cu.get('contextWindow','?')} ({pct_s}) · "
-            f"메시지 {d.get('messageCount','?')} · 큐 {d.get('queuedMessageCount', 0)}",
-            COLOR_STREAM,
-        )
+        if isinstance(pct, (int, float)):
+            frac = pct if pct <= 1 else pct / 100
+        else:
+            frac = 0.0
+        frac = max(0.0, min(1.0, frac))
+        filled = int(round(frac * 20))
+        bar = "█" * filled + "░" * (20 - filled)
+        tokens = cu.get("tokens")
+        window = cu.get("contextWindow")
+        tok_s = f"{tokens:,}" if isinstance(tokens, int) else str(tokens or "?")
+        win_s = f"{window:,}" if isinstance(window, int) else str(window or "?")
+        rows = [
+            ("모델", f"{model.get('provider','?')}/{model.get('id','?')}"),
+            ("사고량", str(d.get("thinkingLevel", "?"))),
+            ("컨텍스트", f"{bar} {frac*100:.0f}%"),
+            ("토큰", f"{tok_s} / {win_s}"),
+            ("메시지", str(d.get("messageCount", "?"))),
+            ("큐", str(d.get("queuedMessageCount", 0))),
+        ]
+        w = max(len(k) for k, _ in rows)
+        table = "\n".join(f"{k.ljust(w)} │ {v}" for k, v in rows)
+        await reply_embed(msg, f"📊 **omp 상태**\n```\n{table}\n```", COLOR_STREAM)
         return True
 
     return False
@@ -595,7 +585,7 @@ async def on_message(msg: discord.Message) -> None:
     subagents: list[str] = []
     collected = ""
 
-    def status_text(done: bool, extra: str = "") -> str:
+    def status_line(done: bool, extra: str = "") -> str:
         elapsed = time.monotonic() - started
         parts = [f"⏱ {elapsed:.1f}s"]
         if tools:
@@ -607,27 +597,19 @@ async def on_message(msg: discord.Message) -> None:
         if extra:
             parts.append(extra)
         parts.append("omp")
-        return ("  ·  ".join(parts))[:2040]
-
-    def build_embed(done: bool, *, timed_out: bool = False, extra: str = "",
-                    body: str | None = None) -> discord.Embed:
-        text = collected if body is None else body
+        prefix = ""
         if not done:
-            desc = (text[:EMBED_DESC_MAX] + "▌") if text else "…"
-            label = "🤔 생각 중…" if not text else "✍️ 작성 중…"
-            color = COLOR_STREAM
-        else:
-            desc = (text[:EMBED_DESC_MAX] if text else "(응답 없음)")
-            label = "⌛ 타임아웃" if timed_out else "✅ 완료"
-            color = COLOR_TIMEOUT if timed_out else COLOR_DONE
-        emb = discord.Embed(description=desc, color=color)
-        emb.set_author(name=label)
-        emb.set_footer(text=status_text(done, extra))
-        emb.set_image(url=f"attachment://{SPACER_NAME}")
-        return emb
+            prefix = "🤔 생각 중…  ·  " if not collected else "✍️ 작성 중…  ·  "
+        # Discord subtext (-#): small grey status line, renders full chat width.
+        return "-# " + prefix + "  ·  ".join(parts)
 
-    placeholder = await msg.reply(embed=build_embed(False), file=_spacer_file(),
-                                  mention_author=False)
+    def render_stream() -> str:
+        body = collected[:DISCORD_MAX] if collected else "…"
+        if collected:
+            body += "▌"  # streaming cursor
+        return body + "\n" + status_line(done=False)
+
+    placeholder = await msg.reply(content=render_stream(), mention_author=False)
     # Register this job so deleting the Discord message can dequeue it while it
     # is still waiting for the session lock (before omp receives the prompt).
     _cur = asyncio.current_task()
@@ -645,22 +627,12 @@ async def on_message(msg: discord.Message) -> None:
     async def flush() -> None:
         nonlocal last_edit, pending, min_interval
         try:
-            await placeholder.edit(embed=build_embed(False))
+            await placeholder.edit(content=render_stream())
             last_edit = time.monotonic()
             pending = False
         except discord.HTTPException as exc:
             if getattr(exc, "status", None) == 429:
                 min_interval = min(min_interval * 1.5, 4.0)
-            else:
-                # Embed rejected for some reason -> fall back to plain text so the
-                # user still sees output instead of a frozen placeholder.
-                try:
-                    body = (collected[:DISCORD_MAX] + "▌") if collected else "…"
-                    await placeholder.edit(content=body, embed=None)
-                    last_edit = time.monotonic()
-                    pending = False
-                except discord.HTTPException:
-                    pass
 
     timed_out = False
     async with msg.channel.typing():
@@ -715,32 +687,32 @@ async def on_message(msg: discord.Message) -> None:
         collected = f"{collected}\n\n{note}" if collected else note
     collected = collected or "(응답 없음)"
 
-    # Long replies: attach as a file, show a preview embed. Else one green embed.
+    footer = "\n" + status_line(done=True, extra=ctx_extra)
+
+    # Long replies: attach as a file instead of paginating across many messages.
     if len(collected) > FILE_THRESHOLD:
-        preview = collected[:1500].rstrip()
+        preview = collected[:600].rstrip()
         buf = io.BytesIO(collected.encode("utf-8"))
         file = discord.File(buf, filename="omp-response.md")
-        body = f"{preview}\n\n… (전체 {len(collected):,}자 — 첨부 파일 참조)"
+        head = f"{preview}\n\n… (전체 {len(collected):,}자 첨부)" + footer
         try:
-            await placeholder.edit(embed=build_embed(True, timed_out=timed_out,
-                                                     extra=ctx_extra, body=body))
+            await placeholder.edit(content=head[:2000])
             await msg.channel.send(file=file)
         except discord.HTTPException as exc:
             print(f"[omp-bot] file send failed: {exc}")
-            try:
-                await placeholder.edit(content=collected[:1900], embed=None)
-            except discord.HTTPException:
-                pass
+            await placeholder.edit(content=collected[:2000])
     else:
-        try:
-            await placeholder.edit(embed=build_embed(True, timed_out=timed_out,
-                                                     extra=ctx_extra))
-        except discord.HTTPException:
-            # Fallback to plain text pagination if the embed is rejected.
-            pages = _chunk(collected, DISCORD_MAX)
-            await placeholder.edit(content=pages[0], embed=None)
-            for extra in pages[1:]:
-                await msg.channel.send(extra)
+        pages = _chunk(collected, DISCORD_MAX)
+        if len(pages[-1]) + len(footer) <= 2000:
+            pages[-1] += footer
+            footer_msg = None
+        else:
+            footer_msg = status_line(done=True, extra=ctx_extra)
+        await placeholder.edit(content=pages[0])
+        for extra in pages[1:]:
+            await msg.channel.send(extra)
+        if footer_msg:
+            await msg.channel.send(footer_msg)
 
     # Ping the author for long turns so they can step away and get notified.
     if elapsed >= PING_AFTER and not timed_out:
