@@ -70,6 +70,31 @@ COLOR_TIMEOUT = 0xFEE75C       # yellow on idle timeout
 COLOR_ERROR = 0xED4245         # red on error
 
 
+def _make_spacer_png(width: int = 1024, height: int = 1) -> bytes:
+    """A wide, fully-transparent PNG. Set as an embed image it forces the card
+    to Discord's max embed width so short answers don't shrink into a tiny box."""
+    import struct
+    import zlib
+
+    def _chunk(typ: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + typ + data
+                + struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)  # 8-bit RGBA
+    raw = (b"\x00" + b"\x00" * (width * 4)) * height             # transparent rows
+    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(raw, 9)) + _chunk(b"IEND", b""))
+
+
+SPACER_PNG = _make_spacer_png()
+SPACER_NAME = "spacer.png"
+
+
+def _spacer_file() -> "discord.File":
+    """Fresh File wrapping the spacer (a File's stream is single-use)."""
+    return discord.File(io.BytesIO(SPACER_PNG), filename=SPACER_NAME)
+
+
 # ---------------------------------------------------------------------------
 # omp RPC session — one subprocess per channel, kept alive for context.
 # ---------------------------------------------------------------------------
@@ -383,9 +408,10 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
 async def reply_embed(msg: discord.Message, text: str, color: int = COLOR_DONE) -> None:
     """Reply with a compact colored embed (keeps command output visually consistent
     with agent answers instead of plain chat text)."""
+    emb = discord.Embed(description=text[:EMBED_DESC_MAX], color=color)
+    emb.set_image(url=f"attachment://{SPACER_NAME}")
     try:
-        await msg.reply(embed=discord.Embed(description=text[:EMBED_DESC_MAX], color=color),
-                        mention_author=False)
+        await msg.reply(embed=emb, file=_spacer_file(), mention_author=False)
     except discord.HTTPException:
         await msg.reply(text[:1900], mention_author=False)
 
@@ -597,9 +623,11 @@ async def on_message(msg: discord.Message) -> None:
         emb = discord.Embed(description=desc, color=color)
         emb.set_author(name=label)
         emb.set_footer(text=status_text(done, extra))
+        emb.set_image(url=f"attachment://{SPACER_NAME}")
         return emb
 
-    placeholder = await msg.reply(embed=build_embed(False), mention_author=False)
+    placeholder = await msg.reply(embed=build_embed(False), file=_spacer_file(),
+                                  mention_author=False)
     # Register this job so deleting the Discord message can dequeue it while it
     # is still waiting for the session lock (before omp receives the prompt).
     _cur = asyncio.current_task()
